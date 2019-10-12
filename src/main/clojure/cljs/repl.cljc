@@ -207,29 +207,49 @@
 (defn compilable? [input]
   (contains? input :source-file))
 
+(defn- deps->string
+  "Get source files as dependencies concatenated as a string."
+  [opts sources]
+  (let [sb (StringBuffer.)]
+    (doseq [source sources]
+      (.append sb (cljsc/add-dep-string opts source)))
+    (when (:repl-verbose opts)
+      (println (.toString sb)))
+    (.toString sb)))
+
 (defn- load-sources
   "Load the compiled `sources` into the REPL."
-  [repl-env sources opts]
-  (if (:output-dir opts)
-    ;; REPLs that read from :output-dir just need to add deps,
-    ;; environment will handle actual loading - David
-    (let [sb (StringBuffer.)]
-      (doseq [source sources]
-        (with-open [rdr (io/reader (:url source))]
-          (.append sb (cljsc/add-dep-string opts source))))
-      (when (:repl-verbose opts)
-        (println (.toString sb)))
-      (-evaluate repl-env "<cljs repl>" 1 (.toString sb)))
-    ;; REPLs that stream must manually load each dep - David
-    (doseq [{:keys [url provides]} sources]
-      (-load repl-env provides url))))
+  ([repl-env sources opts]
+   (load-sources repl-env sources opts true))
+  ([repl-env sources opts with-dependencies?]
+   (if (:output-dir opts)
+     ;; REPLs that read from :output-dir just need to add deps,
+     ;; environment will handle actual loading - David
+     (when with-dependencies?
+       (-evaluate repl-env "<cljs repl>" 1 (deps->string opts sources)))
+     ;; REPLs that stream must manually load each dep - David
+     (doseq [{:keys [url provides]} sources]
+       (-load repl-env provides url)))))
 
 (defn- load-cljs-loader
   "Compile and load the cljs.loader namespace if it's present in `sources`."
   [repl-env sources opts]
   (when-let [source (first (filter #(= (:ns %) 'cljs.loader) sources))]
-    (cljsc/compile-loader sources opts)
+    (time (cljsc/compile-loader sources opts))
     (load-sources repl-env [source] opts)))
+
+(defn- get-sources
+  "Return all the source files that are needed to compile a given namespace."
+  [repl-env ns opts]
+  (seq
+    (when-not (ana/node-module-dep? ns)
+      (let [input (ns->input ns opts)]
+        (if (compilable? input)
+          (->> (cljsc/compile-inputs [input]
+                                     (merge (env->opts repl-env) opts))
+               (remove (comp #{["goog"]} :provides)))
+          (map #(cljsc/source-on-disk opts %)
+               (cljsc/add-js-sources [input] opts)))))))
 
 (defn load-namespace
   "Load a namespace and all of its dependencies into the evaluation environment.
@@ -237,16 +257,8 @@
   loaded once and only once. Returns the compiled sources."
   ([repl-env ns] (load-namespace repl-env ns nil))
   ([repl-env ns opts]
-   (let [ns      (if (and (seq? ns) (= (first ns) 'quote)) (second ns) ns)
-         sources (seq
-                   (when-not (ana/node-module-dep? ns)
-                     (let [input (ns->input ns opts)]
-                       (if (compilable? input)
-                         (->> (cljsc/compile-inputs [input]
-                                (merge (env->opts repl-env) opts))
-                           (remove (comp #{["goog"]} :provides)))
-                         (map #(cljsc/source-on-disk opts %)
-                              (cljsc/add-js-sources [input] opts))))))]
+   (let [ns                 (if (and (seq? ns) (= (first ns) 'quote)) (second ns) ns)
+         sources            (get-sources repl-env ns opts)]
      (when (:repl-verbose opts)
        (println (str "load-namespace " ns " , compiled:") (map :provides sources)))
      (load-sources repl-env sources opts)
@@ -257,7 +269,13 @@
   ([repl-env requires]
    (load-dependencies repl-env requires nil))
   ([repl-env requires opts]
-   (doall (mapcat #(load-namespace repl-env % opts) (distinct requires)))))
+   (let [requires (distinct requires)
+         sources  (->> requires
+                       (mapcat #(get-sources repl-env % opts))
+                       distinct)
+         deps     (deps->string opts sources)]
+     (-evaluate repl-env "<cljs repl>" 1 deps)
+     (load-sources repl-env sources opts false))))
 
 (defn ^File js-src->cljs-src
   "Map a JavaScript output file back to the original ClojureScript source
